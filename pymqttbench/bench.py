@@ -44,21 +44,27 @@ class Sub(multiprocessing.Process):
         self.end_time = None
         self.timeout = timeout
         self.qos = qos
-        self.end_time_lock = multiprocessing.Lock()
+        self.subscribed_evt = multiprocessing.Event()
+    def start_wait_sub(self):
+        self.start()
+        timed_out = self.subscribed_evt.wait(self.timeout)
+        if not timed_out :
+            raise Exception('Failed to subscribe in time')
+
 
     def run(self):
         def on_connect(client, userdata, flags, rc):
             client.subscribe(BASE_TOPIC + '/#', qos=self.qos)
+            self.subscribed_evt.set()
 
         def on_message(client, userdata, msg):
             if self.start_time is None:
                 self.start_time = datetime.datetime.utcnow()
+            #print("Worker {} received message #{}".format(multiprocessing.current_process(), self.msg_count))
             self.msg_count += 1
             if self.msg_count >= self.max_count:
-                self.end_time_lock.acquire()
                 if self.end_time is None:
                     self.end_time = datetime.datetime.utcnow()
-                self.end_time_lock.release()
 
         self.client = mqtt.Client()
         self.client.on_connect = on_connect
@@ -71,13 +77,11 @@ class Sub(multiprocessing.Process):
         self.client.loop_start()
         while True:
             time.sleep(1)
-            self.end_time_lock.acquire()
             if self.end_time:
                 delta = self.end_time - self.start_time
                 SUB_QUEUE.put(delta.total_seconds())
                 self.client.loop_stop()
                 break
-            self.end_time_lock.release()
             if self.start_time:
                 current_time = datetime.datetime.utcnow()
                 curr_delta = current_time - self.start_time
@@ -99,20 +103,29 @@ class Pub(multiprocessing.Process):
         self.end_time = None
         self.timeout = timeout
         self.msg = ''.join(
-            random.choice(string.lowercase) for i in range(msg_size))
+            random.choice(string.ascii_lowercase) for i in range(msg_size))
         self.qos = qos
+        self.mqtt_client = mqtt.Client()
 
     def run(self):
         self.start_time = datetime.datetime.utcnow()
+
+        if self.tls:
+            self.mqtt_client.tls_set(**self.tls)
+        if self.auth:
+            self.mqtt_client.username_pw_set(**self.auth)
+        self.mqtt_client.connect(self.hostname, port=self.port)
+
         for i in range(self.max_count):
-            publish.single(self.topic, self.msg, hostname=self.hostname,
-                           port=self.port, auth=self.auth, tls=self.tls,
-                           qos=self.qos)
+            self.mqtt_client.publish(self.topic, self.msg, qos = self.qos)
+            #print("Worker {} published message #{}".format(multiprocessing.current_process(), i))
             if self.start_time:
                 current_time = datetime.datetime.utcnow()
                 curr_delta = current_time - self.start_time
                 if curr_delta.total_seconds() > self.timeout:
+                    self.mqtt_client.disconnect()
                     raise Exception('We hit the pub timeout!')
+        self.mqtt_client.disconnect()
         end_time = datetime.datetime.utcnow()
         delta = end_time - self.start_time
         PUB_QUEUE.put(delta.total_seconds())
@@ -201,13 +214,21 @@ def main():
         sub = Sub(opts.hostname, opts.port, tls, auth, topic, opts.sub_timeout,
                   opts.sub_count, opts.qos)
         sub_threads.append(sub)
-        sub.start()
+        sub.start_wait_sub()
 
     for i in range(opts.pub_clients):
         pub = Pub(opts.hostname, opts.port, tls, auth, topic, opts.pub_timeout,
                   opts.pub_count, opts.qos)
         pub_threads.append(pub)
         pub.start()
+   
+    start_timer = datetime.datetime.utcnow()
+    for client in pub_threads:
+        client.join(opts.pub_timeout)
+        curr_time = datetime.datetime.utcnow()
+        delta = start_timer - curr_time
+        if delta.total_seconds() >= opts.sub_timeout:
+            raise Exception('Timed out waiting for threads to return')
 
     start_timer = datetime.datetime.utcnow()
     for client in sub_threads:
@@ -217,20 +238,12 @@ def main():
         if delta.total_seconds() >= opts.sub_timeout:
             raise Exception('Timed out waiting for threads to return')
 
-    start_timer = datetime.datetime.utcnow()
-    for client in pub_threads:
-        client.join(opts.pub_timeout)
-        curr_time = datetime.datetime.utcnow()
-        delta = start_timer - curr_time
-        if delta.total_seconds() >= opts.sub_timeout:
-            raise Exception('Timed out waiting for threads to return')
-
     # Let's do some maths
-    if SUB_QUEUE.qsize < opts.sub_clients:
+    if SUB_QUEUE.qsize() < opts.sub_clients:
         print('Something went horribly wrong, there are less results than '
               'sub threads')
         exit(1)
-    if PUB_QUEUE.qsize < opts.pub_clients:
+    if PUB_QUEUE.qsize() < opts.pub_clients:
         print('Something went horribly wrong, there are less results than '
               'pub threads')
         exit(1)
