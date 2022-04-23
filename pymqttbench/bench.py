@@ -123,7 +123,7 @@ def show_progress(subs, pubs, pub_count):
             except:
                 break
             else:
-                relevant_messages.append(msg)
+                relevant_messages.insert(0,msg)
         for msg in relevant_messages :
             print('{}'.format(msg))
         print('------------------------')
@@ -236,13 +236,12 @@ class Pub(multiprocessing.Process):
         try:
             self.client.connect(self.hostname, port=self.port)
             self.client.loop_start()
-            timed_out = self.connected_evt.wait(10)
+            timed_out = self.connected_evt.wait(30)
             if not timed_out : #not connected in time
                 log_relevant("{}-pub-{} - Not connected in time".format(uuid.uuid1(), multiprocessing.current_process()))
                 inc_conn_issues()
                 inc_disconnected_pub()
                 return
-
         except Exception as e:
             log_relevant("{}-pub-{} - {}".format(uuid.uuid1(), multiprocessing.current_process(), str(e)))
             inc_conn_issues()
@@ -257,9 +256,8 @@ class Pub(multiprocessing.Process):
 
             inc_wait_pub()
             res = self.client.publish(self.topic, self.msg, qos = self.qos)
-            try:
-                res.wait_for_publish(5)
-            except:
+            res.wait_for_publish(5)
+            if not res.is_published():
                 inc_pub_issues()
             dec_wait_pub()
 
