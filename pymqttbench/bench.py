@@ -15,9 +15,11 @@
 import argparse
 import datetime
 import multiprocessing
+import signal
 import threading
 import random
 import string
+import uuid
 import time
 from os import system
 
@@ -36,7 +38,6 @@ def inc_published_msg():
     with publishes_count.get_lock():
         publishes_count.value += 1
 
-
 subscriber_recv_count = multiprocessing.Value('i',0)
 def inc_received_msg():
     global subscriber_recv_count
@@ -49,42 +50,102 @@ def inc_connected_pub():
     with connected_pub_count.get_lock():
         connected_pub_count.value += 1
 
+wait_pub_count = multiprocessing.Value('i',0)
+def inc_wait_pub():
+    global wait_pub_count
+    with wait_pub_count.get_lock():
+        wait_pub_count.value += 1
+
+def dec_wait_pub():
+    global wait_pub_count
+    with wait_pub_count.get_lock():
+        wait_pub_count.value -= 1
+
+
+disconnected_pub_count = multiprocessing.Value('i',0)
+def inc_disconnected_pub():
+    global disconnected_pub_count
+    with disconnected_pub_count.get_lock():
+        disconnected_pub_count.value += 1
+
 connected_sub_count = multiprocessing.Value('i',0)
 def inc_connected_sub():
     global connected_sub_count
     with connected_sub_count.get_lock():
         connected_sub_count.value += 1
 
+pub_issues_count = multiprocessing.Value('i',0)
+def inc_pub_issues():
+    global pub_issues_count
+    with pub_issues_count.get_lock():
+        pub_issues_count.value += 1
+
+conn_issues_count = multiprocessing.Value('i',0)
+def inc_conn_issues():
+    global conn_issues_count
+    with conn_issues_count.get_lock():
+        conn_issues_count.value += 1
+
+msgQueue = multiprocessing.Queue()
+def log_relevant(msg):
+    global msgQueue
+    print(msg)
+    msgQueue.put(msg)
+
+last_time = datetime.datetime.utcnow()
+relevant_messages = []
 def show_progress(subs, pubs, pub_count):
-    global publishes_count, subscriber_recv_count, connected_pub_count, connected_sub_count
-    #system("clear")
-    print('------------------------')
-    print('Connected - subs {} / {} '.format(connected_sub_count.value, subs))
-    print('Connected - pubs {} / {} '.format(connected_pub_count.value, pubs))
-    print('Published {} / {} '.format(publishes_count.value, pubs * pub_count))
-    print('Received {} / {} '.format(subscriber_recv_count.value, pubs * pub_count * subs))
-    print('------------------------')
+    global publishes_count, subscriber_recv_count, connected_pub_count, connected_sub_count, disconnected_pub_count, pub_issues_count
+    global conn_issues_count, wait_pub_count, last_time
+    global relevant_messages, msgQueue
+
+    curr_time = datetime.datetime.utcnow()
+    if (curr_time - last_time).total_seconds() >= 1 :
+        system("clear")
+        last_time = curr_time
+        print('------------------------')
+        print('Connected - subs {} / {} '.format(connected_sub_count.value, subs))
+        print('Connected - pubs {} / {} '.format(connected_pub_count.value, pubs))
+        print('Pubs Connection issues {} / {} '.format(conn_issues_count.value, pubs))
+        print('------------------------')
+        print('Waiting for publish {} / {} '.format(wait_pub_count.value, pubs))
+        print('Finished pubs {} / {} '.format(disconnected_pub_count.value, pubs))
+        print('------------------------')
+        print('Total Publish issues {} / {} '.format(pub_issues_count.value, pubs * pub_count))
+        print('Total Published {} / {} '.format(publishes_count.value, pubs * pub_count))
+        print('Total Received {} / {} '.format(subscriber_recv_count.value, pubs * pub_count * subs))
+        print('------------------------')
+        print('Relevant Messages')
+        while True:
+            msg = ''
+            try:
+                msg = msgQueue.get(False)
+            except:
+                break
+            else:
+                relevant_messages.append(msg)
+        for msg in relevant_messages :
+            print('{}'.format(msg))
+        print('------------------------')
+        
 
 class Sub(multiprocessing.Process):
     def __init__(self, hostname, port=1883, tls=None, auth=None, topic=None,
-                 timeout=60, max_count=10, qos=0, n_connections = 1):
+                 timeout=60, max_count=10, qos=0):
         super(Sub, self).__init__()
         self.hostname = hostname
         self.port = port
         self.tls = tls
         self.topic = topic or BASE_TOPIC
         self.auth = auth
-        self.msg_count = [0]*n_connections
-        self.msg_count_mutex = [threading.Lock()]*n_connections
-        self.start_time = [None]*n_connections
+        self.msg_count = 0
+        self.start_time = None
         self.max_count = max_count
-        self.end_times = [None]*n_connections
+        self.end_time = None
         self.timeout = timeout
         self.qos = qos
         self.subscribed_evt = multiprocessing.Event()
-        self.n_connected_mutex = multiprocessing.Lock()
-        self.n_connections = n_connections
-        self.n_connected = 0
+        self.finished_evt = multiprocessing.Event()
     
     def start_wait_sub(self):
         self.start()
@@ -92,173 +153,130 @@ class Sub(multiprocessing.Process):
         if not timed_out :
             raise Exception('Failed to subscribe in time')
 
-
     def run(self):
         def on_connect(client, userdata, flags, rc):
-            inc_connected_sub()
             client.subscribe(BASE_TOPIC + '/#', qos=self.qos)
-            client_idx = self.clients.index(client)
-            self.n_connected_mutex.acquire()
-            self.n_connected = self.n_connected + 1
-            if self.n_connected == self.n_connections :
-                self.subscribed_evt.set()
-            self.n_connected_mutex.release()
-
-        def on_connect_fail(client, userdata):
-            client_idx = self.clients.index(client)
-            print('connection fail for {} in thread {}'.format(client,multiprocessing.current_process()))
+            self.subscribed_evt.set()
+            inc_connected_sub()
 
         def on_message(client, userdata, msg):
+            if self.start_time is None:
+                self.start_time = datetime.datetime.utcnow()
+            self.msg_count += 1
             inc_received_msg()
+            self.end_time = datetime.datetime.utcnow()
+            if self.msg_count >= self.max_count:
+                self.finished_evt.set()
+                
 
-            client_idx = self.clients.index(client)
-
-            self.msg_count_mutex[client_idx].acquire()
-            if self.start_time[client_idx] is None:
-                self.start_time[client_idx] = datetime.datetime.utcnow()
-            #print("Worker {} received message #{}".format(multiprocessing.current_process(), self.msg_count))
-
-            self.msg_count[client_idx] += 1
-            if self.msg_count[client_idx] >= self.max_count:
-                print("Worker {} finished msg count/max {}/{}".format(multiprocessing.current_process(), self.msg_count[client_idx], self.max_count))
-                if self.end_times[client_idx] is None:
-                    self.end_times[client_idx] = datetime.datetime.utcnow()
-                    delta = self.end_times[client_idx] - self.start_time[client_idx]
-                    SUB_QUEUE.put(delta.total_seconds())
-            self.msg_count_mutex[client_idx].release()
-        
-        
-        self.clients = [None]*self.n_connections
-        
-        print('Creating {} connections for sub-thread {} - max count {} '.format(self.n_connections, multiprocessing.current_process(), self.max_count))
-        for i in range(self.n_connections):
-            self.clients[i] = mqtt.Client(client_id="sub{}-{}".format(i, multiprocessing.current_process()))
-            self.clients[i].on_connect = on_connect
-            self.clients[i].on_message = on_message
-            self.clients[i].on_connect_fail = on_connect_fail
-            
-            if self.tls:
-                self.clients[i].tls_set(**self.tls)
-            if self.auth:
-                self.clients[i].username_pw_set(**self.auth)
-            self.clients[i].connect(self.hostname, port=self.port)
-            self.clients[i].loop_start()
-
-        start_time = datetime.datetime.utcnow()
-        while True: #somehow subscribers wont receive all msgs
-            time.sleep(1)
-            finished = 0
-            for i in range(self.n_connections):
-                if self.end_times[i] != None:
-                    if self.clients[i].loop_stop():
-                        finished = finished + 1
-            if finished == self.n_connections:
+        self.client = mqtt.Client(client_id="{}-sub-{}".format(uuid.uuid1(), multiprocessing.current_process()))
+        self.client.on_connect = on_connect
+        self.client.on_message = on_message
+        if self.tls:
+            self.client.tls_set(**self.tls)
+        if self.auth:
+            self.client.username_pw_set(**self.auth)
+        self.client.connect(self.hostname, port=self.port)
+        self.client.loop_start()
+        while True:
+            end_evt = self.finished_evt.wait(1)
+            if end_evt:
+                delta = self.end_time - self.start_time
+                SUB_QUEUE.put(delta.total_seconds())
+                self.client.disconnect()
+                self.client.loop_stop()
                 break
-            current_time = datetime.datetime.utcnow()
-            curr_delta = current_time - start_time
-            if curr_delta.total_seconds() > self.timeout:
-                raise Exception('We hit the sub timeout!')
 
 
 class Pub(multiprocessing.Process):
     def __init__(self, hostname, port=1883, tls=None, auth=None, topic=None,
-                 timeout=60, max_count=10, msg_size=1024, qos=0, n_connections = 1):
+                 timeout=60, max_count=10, msg_size=1024, qos=0):
         super(Pub, self).__init__()
         self.hostname = hostname
         self.port = port
         self.tls = tls
         self.topic = topic or BASE_TOPIC
         self.auth = auth
-        self.start_times = [None]*n_connections
-        self.end_times = [None]*n_connections
+        self.start_time = None
         self.max_count = max_count
-        self.n_published = [0]*n_connections
-        self.n_published_mutexes = [threading.Lock()]*n_connections
-        self.publish_elapsed_times = [None]*n_connections
-        self.n_connections = n_connections
+        self.end_time = None
         self.timeout = timeout
         self.msg = ''.join(
             random.choice(string.ascii_lowercase) for i in range(msg_size))
         self.qos = qos
-        self.mqtt_clients = [None]*n_connections#mqtt.Client()
+        self.client = None
+        self.finished_evt = multiprocessing.Event()
+        self.connected_evt = multiprocessing.Event()
 
+    
     def run(self):
-
         def on_connect(client, userdata, flags, rc):
             inc_connected_pub()
-            client.publish(self.topic, self.msg, qos = self.qos)
+            self.connected_evt.set()
+
+        def on_disconnect(client, userdata, rc):
+            inc_disconnected_pub()
+            self.finished_evt.set()
 
         def on_publish(client, userdata, mid):
-            client_idx = self.mqtt_clients.index(client)
             inc_published_msg()
 
-            #print("Worker {} trying to publish msg #{}".format(multiprocessing.current_process(), self.n_published[client_idx]))
-            self.n_published_mutexes[client_idx].acquire()
-            self.n_published[client_idx] += 1
-            #print("Worker {} published msg #{}".format(multiprocessing.current_process(), self.n_published[client_idx]))
-            if self.n_published[client_idx] >= self.max_count :
-                #print("Worker {} finished msg count/max {}/{}".format(multiprocessing.current_process(), self.n_published[client_idx], self.end_times[client_idx]))
-                if self.end_times[client_idx] is None :
-                    self.end_times[client_idx] = datetime.datetime.utcnow() 
-                    publish_elapsed_time = self.end_times[client_idx] - self.start_times[client_idx]
-                    PUB_QUEUE.put(publish_elapsed_time.total_seconds())
-            else:
-                #print("Worker {} trying to publish msg #{}".format(multiprocessing.current_process(), self.n_published[client_idx]+1))
-                client.publish(self.topic, self.msg, qos = self.qos)
-            self.n_published_mutexes[client_idx].release()
+        self.client = mqtt.Client(client_id="{}-pub-{}".format(uuid.uuid1(), multiprocessing.current_process()))
+        if self.tls:
+            self.client.tls_set(**self.tls)
+        if self.auth:
+            self.client.username_pw_set(**self.auth)
         
-        print('Creating {} connections for pub-thread {}'.format(self.n_connections, multiprocessing.current_process()))
-        for i in range(self.n_connections):
-            self.mqtt_clients[i] = mqtt.Client(client_id="pub{}-{}".format(i, multiprocessing.current_process()))
-            if self.tls:
-                self.mqtt_clients[i].tls_set(**self.tls)
-            if self.auth:
-                self.mqtt_clients[i].username_pw_set(**self.auth)
-            
-            self.mqtt_clients[i].on_publish = on_publish
-            self.mqtt_clients[i].on_connect = on_connect
-            self.start_times[i] = datetime.datetime.utcnow()
-            self.mqtt_clients[i].connect(self.hostname, port=self.port)
-            self.mqtt_clients[i].loop_start()
-            
-        
+        self.client.on_publish = on_publish
+        self.client.on_disconnect = on_disconnect
+        self.client.on_connect = on_connect
+        self.start_time = datetime.datetime.utcnow()
 
-        start_time = datetime.datetime.utcnow()
-        while True: 
-            time.sleep(1)
-            finished = 0
-            for i in range(self.n_connections):
-                if self.end_times[i] != None:
-                    if self.mqtt_clients[i].loop_stop():
-                        finished = finished + 1
-            if finished == self.n_connections:
+
+        try:
+            self.client.connect(self.hostname, port=self.port)
+            self.client.loop_start()
+            timed_out = self.connected_evt.wait(10)
+            if not timed_out : #not connected in time
+                log_relevant("{}-pub-{} - Not connected in time".format(uuid.uuid1(), multiprocessing.current_process()))
+                inc_conn_issues()
+                inc_disconnected_pub()
+                return
+
+        except Exception as e:
+            log_relevant("{}-pub-{} - {}".format(uuid.uuid1(), multiprocessing.current_process(), str(e)))
+            inc_conn_issues()
+            inc_disconnected_pub()
+            return
+
+        
+        for i in range(self.max_count):
+            end_evt = self.finished_evt.wait(1)
+            if end_evt:
                 break
-                #print("Worker publisher {} finished ".format(multiprocessing.current_process()))
-                #this connects and publish in a single method, not sure if it keeps connection active
-                #publish.single(topic=self.topic, payload=self.msg, hostname=self.hostname, port=self.port,
-                #                client_id = "pub{}-{}".format(j, multiprocessing.current_process()), 
-                #                tls=self.tls, auth=self.auth,  qos = self.qos)
-                
-                
-                #publish_time_e = datetime.datetime.utcnow()
-                #if self.publish_elapsed_times[j] == None :
-                #    self.publish_elapsed_times[j] = publish_time_e - publish_time_b
-                #else:
-                #    self.publish_elapsed_times[j] += publish_time_e - publish_time_b
-                #print("Worker {} published message #{}".format(multiprocessing.current_process(), i))
-            #timeout test
-            runnig_time = datetime.datetime.utcnow() - start_time
-            if runnig_time.total_seconds() > self.timeout:
-                for k in range(self.n_connections):
-                    self.mqtt_clients[k].disconnect()
-                raise Exception('We hit the pub timeout!')
-        #for j in range(self.n_connections):
-        #    PUB_QUEUE.put(self.publish_elapsed_times[j].total_seconds())
-        for j in range(self.n_connections):
-            self.mqtt_clients[j].disconnect()
+
+            inc_wait_pub()
+            res = self.client.publish(self.topic, self.msg, qos = self.qos)
+            try:
+                res.wait_for_publish(5)
+            except:
+                inc_pub_issues()
+            dec_wait_pub()
+
+        #reset event just in case
+        self.finished_evt.clear()
+
+        self.client.disconnect()
+        timed_out = self.finished_evt.wait(10) #waits 10 seconds to disconnect
+        self.client.loop_stop()
+        end_time = datetime.datetime.utcnow()
+        delta = end_time - self.start_time
+        PUB_QUEUE.put(delta.total_seconds())
 
 
 def main():
+    global msgQueue
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--pub-clients', type=int, dest='pub_clients',
                         default=10,
@@ -273,10 +291,11 @@ def main():
                         help='The number of messages each publisher client '
                              'will publish for completing. The default count '
                              'is 10')
-    parser.add_argument('--sub-count', type=int, default=None, dest='sub_count',
+    parser.add_argument('--sub-count', type=int, dest='sub_count',
+                        default=None,
                         help='The number of messages each subscriber client '
                              'will wait to recieve before completing. The '
-                             'default count is pub_count.')
+                             'default count is 10.')
     parser.add_argument('--msg-size', type=int, dest='msg_size', default=1024,
                         help='The payload size to use in bytes')
     parser.add_argument('--sub-timeout', type=int, dest='sub_timeout',
@@ -313,8 +332,6 @@ def main():
                              'the order of results in this format')
     parser.add_argument('--qos', default=0, type=int, choices=[0, 1, 2],
                         help='The qos level to use for the benchmark')
-    parser.add_argument('--threads', default=8, type=int,
-                        help='The number of threads to create, defaults to 8')
 
     opts = parser.parse_args()
 
@@ -331,125 +348,110 @@ def main():
         auth = {'username': opts.username,
                 'password': getattr(opts, 'password')}
 
-    if opts.sub_count is not None:
-        if opts.pub_count * opts.pub_clients < opts.sub_count:
-            print('The configured number of publisher clients and published '
-                'message count is too small for the configured subscriber count.'
-                ' Increase the value of --pub-count and/or --pub-clients, or '
-                'decrease the value of --sub-count.')
-            exit(1)
-    else :
+    if opts.sub_count is None :
         opts.sub_count = opts.pub_count * opts.pub_clients
+    elif opts.pub_count * opts.pub_clients < opts.sub_count:
+        print('The configured number of publisher clients and published '
+              'message count is too small for the configured subscriber count.'
+              ' Increase the value of --pub-count and/or --pub-clients, or '
+              'decrease the value of --sub-count.')
+        exit(1)
 
-    # the total amount of threads is at most opts.threads * 2 + 2, will keep this way for simplicity
-    # maybe change the name of parameter to make it more clear
-    if opts.sub_clients // opts.threads > 0 :
-        for i in range(opts.threads):
-            sub = Sub(opts.hostname, opts.port, tls, auth, topic, opts.sub_timeout,
-                    opts.sub_count, opts.qos, opts.sub_clients // opts.threads)
-            sub_threads.append(sub)
-            sub.start_wait_sub()
-    if  opts.sub_clients % opts.threads != 0: #this will possibly create opts.threads + 1 threads instead of the exact number, for simplicity
+
+    for i in range(opts.sub_clients):
         sub = Sub(opts.hostname, opts.port, tls, auth, topic, opts.sub_timeout,
-                  opts.sub_count, opts.qos, opts.sub_clients % opts.threads)
+                  opts.sub_count, opts.qos)
         sub_threads.append(sub)
         sub.start_wait_sub()
-        
-    if opts.pub_clients // opts.threads > 0 :
-        for i in range(opts.threads):
-            pub = Pub(opts.hostname, opts.port, tls, auth, topic, opts.pub_timeout,
-                    opts.pub_count, opts.msg_size, opts.qos, opts.pub_clients // opts.threads)
-            pub_threads.append(pub)
-            pub.start()
-    if  opts.pub_clients % opts.threads != 0: #this will possibly create opts.threads + 1 threads instead of the exact number, for simplicity
+        show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
+
+
+    for i in range(opts.pub_clients):
         pub = Pub(opts.hostname, opts.port, tls, auth, topic, opts.pub_timeout,
-                  opts.pub_count, opts.msg_size, opts.qos, opts.pub_clients % opts.threads)
+                  opts.pub_count, opts.qos)
         pub_threads.append(pub)
         pub.start()
-#
-#    for i in range(opts.pub_clients):
-#        pub = Pub(opts.hostname, opts.port, tls, auth, topic, opts.pub_timeout,
-#                  opts.pub_count, opts.qos)
-#        pub_threads.append(pub)
-#        pub.start()
-   
+        show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
+
     start_timer = datetime.datetime.utcnow()
-    while True : #loops until all terminate
+    timeout = False
+    while True : #loops until all publishers terminate
         terminated = 0
         for client in pub_threads:
             client.join(1)
+            curr_time = datetime.datetime.utcnow()
+            delta = curr_time - start_timer
+            if delta.total_seconds() >= opts.pub_timeout:
+                timeout = True
+                break
             if client.exitcode != None :
                 terminated = terminated + 1
-            show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
-            curr_time = datetime.datetime.utcnow()
-            delta = start_timer - curr_time
-            if delta.total_seconds() >= opts.sub_timeout:
-                raise Exception('Timed out waiting for threads to return')
-        if terminated == len(pub_threads) :
+        if terminated == len(pub_threads) or timeout:
             break
+        else:
+            show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
+    
+    if timeout : # kill all remaining publishers if timed out
+        log_relevant('Pubs timedout finishing them all')
+        for client in pub_threads:
+            client.finished_evt.set()
+            client.join()
+    else:
+        log_relevant('Waiting for subs')
 
     start_timer = datetime.datetime.utcnow()
+    timeout = False
     while True :
         terminated = 0
         for client in sub_threads:
             client.join(1)
-            if client.exitcode != None :
-                    terminated = terminated + 1
-            show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
             curr_time = datetime.datetime.utcnow()
-            delta = start_timer - curr_time
+            delta = curr_time - start_timer
             if delta.total_seconds() >= opts.sub_timeout:
-                raise Exception('Timed out waiting for threads to return')
-        if terminated == len(sub_threads) :
+                timeout = True
+                break
+            if client.exitcode != None :
+                terminated = terminated + 1
+        if terminated == len(sub_threads) or timeout:
             break
-    
-    show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
+        else:
+            show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
 
-    # Let's do some maths
-    if SUB_QUEUE.qsize() < opts.sub_clients:
-        print('Something went horribly wrong, there are less results than '
-              'sub threads {} < {}'.format(SUB_QUEUE.qsize(), opts.sub_clients))
-        exit(1)
-    if PUB_QUEUE.qsize() < opts.pub_clients:
-        print('Something went horribly wrong, there are less results than '
-              'pub threads {} < {}'.format(PUB_QUEUE.qsize(), opts.pub_clients))
-        exit(1)
+    if timeout : #terminate all subers
+        log_relevant('Subs timedout finishing them')
+        for client in sub_threads:
+            client.finished_evt.set()
+            client.join()
+
+    # Queues can be different in sise since there could be connection issues
 
     sub_times = []
     for i in range(opts.sub_clients):
         try:
-            sub_times.append(SUB_QUEUE.get(opts.sub_timeout))
+            sub_times.append(SUB_QUEUE.get(False))
         except multiprocessing.queues.Empty:
             continue
     if len(sub_times) < opts.sub_clients:
         failed_count = opts.sub_clients - len(sub_times)
     sub_times = numpy.array(sub_times)
 
+    
+
     pub_times = []
-    for i in range(opts.pub_clients):
+    for i in range(disconnected_pub_count.value - conn_issues_count.value):
         try:
-            pub_times.append(PUB_QUEUE.get(opts.pub_timeout))
+            pub_times.append(PUB_QUEUE.get(False))
         except multiprocessing.queues.Empty:
             continue
-    if len(pub_times) < opts.pub_clients:
-        failed_count = opts.pub_clients - len(pub_times)
+    failed_count = conn_issues_count.value
     pub_times = numpy.array(pub_times)
 
-    if len(sub_times) < opts.sub_clients:
-        failed_count = opts.sub_clients - len(sub_times)
-        print("%s subscription workers failed" % failed_count)
-    if len(pub_times) < opts.pub_clients:
-        failed_count = opts.pub_clients - len(pub_times)
-        print("%s publishing workers failed" % failed_count)
-
     sub_mean_duration = numpy.mean(sub_times)
-    sub_avg_throughput = float(opts.sub_count) / float(sub_mean_duration)
-    sub_total_thpt = float(
-        opts.sub_count * opts.sub_clients) / float(sub_mean_duration)
+    sub_avg_throughput = (subscriber_recv_count.value / opts.pub_clients) / float(sub_mean_duration)
+    sub_total_thpt = float( subscriber_recv_count.value ) / float(sub_mean_duration)
     pub_mean_duration = numpy.mean(pub_times)
-    pub_avg_throughput = float(opts.pub_count) / float(pub_mean_duration)
-    pub_total_thpt = float(
-        opts.pub_count * opts.pub_clients) / float(pub_mean_duration)
+    pub_avg_throughput = float(publishes_count.value / opts.pub_count) / float(pub_mean_duration)
+    pub_total_thpt = publishes_count.value / pub_mean_duration
     if opts.brief:
         output = '%s:%s:%s:%s:%s:%s:%s:%s:%s:%s'
     else:
