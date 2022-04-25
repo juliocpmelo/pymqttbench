@@ -244,7 +244,8 @@ class Pub(multiprocessing.Process):
                            port=self.port, auth=self.auth, tls=self.tls,
                            qos=self.qos)
                 inc_published_msg()
-            except:
+            except Exception as e:
+                log_relevant("Expt: pub-{} - {} - Failed: {}/{} msg left".format(multiprocessing.current_process(), str(e), i+1, self.max_count))
                 inc_pub_issues()
             dec_wait_pub()
 
@@ -284,7 +285,7 @@ class Pub(multiprocessing.Process):
                 self.client.loop_start()
                 timed_out = self.connected_evt.wait(30)
                 if not timed_out : #not connected in time, reconnect
-                    log_relevant("{}-pub-{} - Not connected in time".format(uuid.uuid1(), multiprocessing.current_process()))
+                    log_relevant("{}-pub-{} - Not connected in time - retrying".format(uuid.uuid1(), multiprocessing.current_process()))
                     inc_conn_issues()
                     #inc_conn_issues()
                     self.client.disconnect()
@@ -298,7 +299,7 @@ class Pub(multiprocessing.Process):
                     dec_wait_connection()
                     break
             except Exception as e:
-                log_relevant("Expt: {}-pub-{} - {}".format(uuid.uuid1(), multiprocessing.current_process(), str(e)))
+                log_relevant("Expt: {}-pub-{} - {} - retrying".format(uuid.uuid1(), multiprocessing.current_process(), str(e)))
                 inc_conn_issues()
                 self.client.loop_stop()
                 #inc_disconnected_pub()
@@ -410,8 +411,8 @@ def main():
     if opts.sub_count is None : #expect to receive only the self published messages
         opts.sub_count = opts.pub_count * opts.pub_clients
    
-
-    print("Waiting {} - {} seconds between publishes".format(opts.wait_range[0], opts.wait_range[1]))
+    opts.wait_range.sort()
+    log_relevant("Waiting {} - {} seconds between publishes".format(opts.wait_range[0], opts.wait_range[1]))
 
     for i in range(opts.sub_clients):
         
