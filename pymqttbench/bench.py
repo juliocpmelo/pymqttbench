@@ -20,8 +20,10 @@ import threading
 import random
 import string
 import uuid
+import random
 import time
 from os import system
+import sys
 
 import numpy
 import paho.mqtt.client as mqtt
@@ -61,6 +63,17 @@ def dec_wait_pub():
     with wait_pub_count.get_lock():
         wait_pub_count.value -= 1
 
+wait_connection = multiprocessing.Value('i',0)
+def inc_wait_connection():
+    global wait_connection
+    with wait_connection.get_lock():
+        wait_connection.value += 1
+
+def dec_wait_connection():
+    global wait_connection
+    with wait_connection.get_lock():
+        wait_connection.value -= 1
+
 
 disconnected_pub_count = multiprocessing.Value('i',0)
 def inc_disconnected_pub():
@@ -89,27 +102,28 @@ def inc_conn_issues():
 msgQueue = multiprocessing.Queue()
 def log_relevant(msg):
     global msgQueue
-    print(msg)
+    #print(msg)
     msgQueue.put(msg)
 
 last_time = datetime.datetime.utcnow()
 relevant_messages = []
-def show_progress(subs, pubs, pub_count):
+def show_progress(subs, pubs, pub_count, force=False):
     global publishes_count, subscriber_recv_count, connected_pub_count, connected_sub_count, disconnected_pub_count, pub_issues_count
-    global conn_issues_count, wait_pub_count, last_time
+    global conn_issues_count, wait_pub_count, last_time, wait_connection
     global relevant_messages, msgQueue
 
     curr_time = datetime.datetime.utcnow()
-    if (curr_time - last_time).total_seconds() >= 1 :
-        system("clear")
+    if (curr_time - last_time).total_seconds() >= 1 or force:
+        #system("clear")
         last_time = curr_time
         print('------------------------')
         print('Connected - subs {} / {} '.format(connected_sub_count.value, subs))
         print('Connected - pubs {} / {} '.format(connected_pub_count.value, pubs))
-        print('Pubs Connection issues {} / {} '.format(conn_issues_count.value, pubs))
+        print('Waiting Connection - pubs {} / {} '.format(wait_connection.value, pubs))
+        print('Connection issues - pubs {} / {} '.format(conn_issues_count.value, pubs))
         print('------------------------')
         print('Waiting for publish {} / {} '.format(wait_pub_count.value, pubs))
-        print('Finished pubs {} / {} '.format(disconnected_pub_count.value, pubs))
+        print('Finished/Disconnected pubs {} / {} '.format(disconnected_pub_count.value, pubs))
         print('------------------------')
         print('Total Publish issues {} / {} '.format(pub_issues_count.value, pubs * pub_count))
         print('Total Published {} / {} '.format(publishes_count.value, pubs * pub_count))
@@ -190,7 +204,7 @@ class Sub(multiprocessing.Process):
 
 class Pub(multiprocessing.Process):
     def __init__(self, hostname, port=1883, tls=None, auth=None, topic=None,
-                 timeout=60, max_count=10, msg_size=1024, qos=0):
+                 timeout=60, max_count=10, msg_size=1024, qos=0, disconnect_on_publish = True, wait_range = [0,0]):
         super(Pub, self).__init__()
         self.hostname = hostname
         self.port = port
@@ -206,17 +220,47 @@ class Pub(multiprocessing.Process):
         self.qos = qos
         self.client = None
         self.finished_evt = multiprocessing.Event()
+        self.disconnected_evt = multiprocessing.Event()
         self.connected_evt = multiprocessing.Event()
+        self.disconnec_on_publish = disconnect_on_publish
+        self.wait_range = wait_range
+        self.wait_range.sort()
+
+    def run(self):
+        random.seed(uuid.uuid1())
+        if not self.disconnec_on_publish :
+            self.run_publish_not_disconnect()
+        else:
+            self.run_publish_disconnect()
+
+    def run_publish_disconnect(self):
+        self.start_time = datetime.datetime.utcnow()
+
+        for i in range(self.max_count):
+            self.finished_evt.wait(random.randint(*self.wait_range))
+            inc_wait_pub()
+            try:
+                publish.single(self.topic, self.msg, hostname=self.hostname,
+                           port=self.port, auth=self.auth, tls=self.tls,
+                           qos=self.qos)
+                inc_published_msg()
+            except:
+                inc_pub_issues()
+            dec_wait_pub()
+
+        end_time = datetime.datetime.utcnow()
+        delta = end_time - self.start_time
+        PUB_QUEUE.put(delta.total_seconds())
+        inc_disconnected_pub()
 
     
-    def run(self):
+    def run_publish_not_disconnect(self):
         def on_connect(client, userdata, flags, rc):
             inc_connected_pub()
             self.connected_evt.set()
 
         def on_disconnect(client, userdata, rc):
-            inc_disconnected_pub()
-            self.finished_evt.set()
+            self.disconnected_evt.set()
 
         def on_publish(client, userdata, mid):
             inc_published_msg()
@@ -232,28 +276,39 @@ class Pub(multiprocessing.Process):
         self.client.on_connect = on_connect
         self.start_time = datetime.datetime.utcnow()
 
-
-        try:
-            self.client.connect(self.hostname, port=self.port)
-            self.client.loop_start()
-            timed_out = self.connected_evt.wait(30)
-            if not timed_out : #not connected in time
-                log_relevant("{}-pub-{} - Not connected in time".format(uuid.uuid1(), multiprocessing.current_process()))
+        inc_wait_connection()
+        while True:
+            try:
+                self.finished_evt.wait(random.randint(*self.wait_range))
+                self.client.connect(self.hostname, port=self.port)
+                self.client.loop_start()
+                timed_out = self.connected_evt.wait(30)
+                if not timed_out : #not connected in time, reconnect
+                    log_relevant("{}-pub-{} - Not connected in time".format(uuid.uuid1(), multiprocessing.current_process()))
+                    inc_conn_issues()
+                    #inc_conn_issues()
+                    self.client.disconnect()
+                    timed_out = self.disconnected_evt.wait(1)
+                    self.disconnected_evt.clear()
+                    self.client.loop_stop()
+                    #inc_disconnected_pub()
+                    #return
+                else: #connected!
+                    self.disconnected_evt.clear()
+                    dec_wait_connection()
+                    break
+            except Exception as e:
+                log_relevant("Expt: {}-pub-{} - {}".format(uuid.uuid1(), multiprocessing.current_process(), str(e)))
                 inc_conn_issues()
-                inc_disconnected_pub()
-                return
-        except Exception as e:
-            log_relevant("{}-pub-{} - {}".format(uuid.uuid1(), multiprocessing.current_process(), str(e)))
-            inc_conn_issues()
-            inc_disconnected_pub()
-            return
+                self.client.loop_stop()
+                #inc_disconnected_pub()
+                #return
 
         
         for i in range(self.max_count):
-            end_evt = self.finished_evt.wait(1)
+            end_evt = self.finished_evt.wait(random.randint(*self.wait_range))
             if end_evt:
                 break
-
             inc_wait_pub()
             res = self.client.publish(self.topic, self.msg, qos = self.qos)
             res.wait_for_publish(5)
@@ -261,15 +316,13 @@ class Pub(multiprocessing.Process):
                 inc_pub_issues()
             dec_wait_pub()
 
-        #reset event just in case
-        self.finished_evt.clear()
-
-        self.client.disconnect()
-        timed_out = self.finished_evt.wait(10) #waits 10 seconds to disconnect
-        self.client.loop_stop()
+        #self.client.disconnect()
+        #timed_out = self.disconnected_evt.wait(10) #waits 10 seconds to disconnect
+        #self.client.loop_stop()
         end_time = datetime.datetime.utcnow()
         delta = end_time - self.start_time
         PUB_QUEUE.put(delta.total_seconds())
+        inc_disconnected_pub()
 
 
 def main():
@@ -331,6 +384,14 @@ def main():
     parser.add_argument('--qos', default=0, type=int, choices=[0, 1, 2],
                         help='The qos level to use for the benchmark')
 
+    parser.add_argument('--wait-range', nargs=2, default=[0,0], type=int, dest='wait_range',
+                        help='Wait a random number of seconds, in range, before connecting or sending publishes')
+
+    parser.add_argument('--disconnect-on-publish', default=True, action='store_true', dest='disconnect_on_publish',
+                        help='If present the client will do connect, publish, disconnect (can take longer)')
+    parser.add_argument('--no-disconnect-on-publish', action='store_false', dest='disconnect_on_publish',
+                        help='If present the client will do not connect, publish, disconnect (can take longer)')
+
     opts = parser.parse_args()
 
     sub_threads = []
@@ -346,54 +407,71 @@ def main():
         auth = {'username': opts.username,
                 'password': getattr(opts, 'password')}
 
-    if opts.sub_count is None :
+    if opts.sub_count is None : #expect to receive only the self published messages
         opts.sub_count = opts.pub_count * opts.pub_clients
-    elif opts.pub_count * opts.pub_clients < opts.sub_count:
-        print('The configured number of publisher clients and published '
-              'message count is too small for the configured subscriber count.'
-              ' Increase the value of --pub-count and/or --pub-clients, or '
-              'decrease the value of --sub-count.')
-        exit(1)
+   
 
+    print("Waiting {} - {} seconds between publishes".format(opts.wait_range[0], opts.wait_range[1]))
 
     for i in range(opts.sub_clients):
-        sub = Sub(opts.hostname, opts.port, tls, auth, topic, opts.sub_timeout,
-                  opts.sub_count, opts.qos)
+        
+        sub = Sub(hostname=opts.hostname, 
+                  port=opts.port, 
+                  tls=tls, 
+                  auth=auth, 
+                  topic=topic, 
+                  timeout=opts.sub_timeout,
+                  max_count=opts.sub_count, 
+                  qos=opts.qos)
         sub_threads.append(sub)
         sub.start_wait_sub()
         show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
 
 
     for i in range(opts.pub_clients):
-        pub = Pub(opts.hostname, opts.port, tls, auth, topic, opts.pub_timeout,
-                  opts.pub_count, opts.qos)
+        pub = Pub(hostname=opts.hostname, 
+                  port=opts.port, 
+                  tls=tls, 
+                  auth=auth, 
+                  topic=topic, 
+                  timeout=opts.pub_timeout,
+                  max_count=opts.pub_count, 
+                  qos=opts.qos,
+                  disconnect_on_publish = opts.disconnect_on_publish, 
+                  wait_range=opts.wait_range)
         pub_threads.append(pub)
         pub.start()
         show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
 
     start_timer = datetime.datetime.utcnow()
     timeout = False
-    while True : #loops until all publishers terminate
+    last_terminated = 0
+    while True : #waits for all publishers, or pub timeout
         terminated = 0
         for client in pub_threads:
-            client.join(1)
+            client.join(timeout=1)
             curr_time = datetime.datetime.utcnow()
             delta = curr_time - start_timer
+
             if delta.total_seconds() >= opts.pub_timeout:
                 timeout = True
                 break
-            if client.exitcode != None :
-                terminated = terminated + 1
-        if terminated == len(pub_threads) or timeout:
+            else:
+                show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
+            
+            if disconnected_pub_count.value == len(pub_threads):
+                break
+        if disconnected_pub_count.value == len(pub_threads) or timeout:
             break
-        else:
-            show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
     
+    show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count, force=True) 
+
     if timeout : # kill all remaining publishers if timed out
-        log_relevant('Pubs timedout finishing them all')
+        log_relevant('Pubs timedout terminate()ing them all')
         for client in pub_threads:
-            client.finished_evt.set()
+            client.terminate()
             client.join()
+        log_relevant('Waiting for subs')
     else:
         log_relevant('Waiting for subs')
 
@@ -402,18 +480,21 @@ def main():
     while True :
         terminated = 0
         for client in sub_threads:
-            client.join(1)
+            client.join(timeout=1)
             curr_time = datetime.datetime.utcnow()
             delta = curr_time - start_timer
+            
             if delta.total_seconds() >= opts.sub_timeout:
                 timeout = True
                 break
+            else:
+                show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
             if client.exitcode != None :
                 terminated = terminated + 1
         if terminated == len(sub_threads) or timeout:
             break
-        else:
-            show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count)
+
+    show_progress(opts.sub_clients, opts.pub_clients, opts.pub_count, force=True) 
 
     if timeout : #terminate all subers
         log_relevant('Subs timedout finishing them')
@@ -436,14 +517,16 @@ def main():
     
 
     pub_times = []
-    for i in range(disconnected_pub_count.value - conn_issues_count.value):
+    for i in range(disconnected_pub_count.value):
         try:
             pub_times.append(PUB_QUEUE.get(False))
         except multiprocessing.queues.Empty:
             continue
-    failed_count = conn_issues_count.value
+
+    failed_count = opts.pub_clients - disconnected_pub_count.value
     pub_times = numpy.array(pub_times)
 
+    print("Pub times size {} | Sub times size {}".format(len(pub_times), len(sub_times)))
     sub_mean_duration = numpy.mean(sub_times)
     sub_avg_throughput = (subscriber_recv_count.value / opts.pub_clients) / float(sub_mean_duration)
     sub_total_thpt = float( subscriber_recv_count.value ) / float(sub_mean_duration)
