@@ -150,7 +150,10 @@ class Sub(multiprocessing.Process):
         self.hostname = hostname
         self.port = port
         self.tls = tls
-        self.topic = topic or BASE_TOPIC
+        if topic is not None:
+            self.topic = BASE_TOPIC + '/' + topic
+        else:
+            self.topic = BASE_TOPIC + '/bench'
         self.auth = auth
         self.msg_count = 0
         self.start_time = None
@@ -209,7 +212,10 @@ class Pub(multiprocessing.Process):
         self.hostname = hostname
         self.port = port
         self.tls = tls
-        self.topic = topic or BASE_TOPIC
+        if topic is not None:
+            self.topic = BASE_TOPIC + '/' + topic
+        else:
+            self.topic = BASE_TOPIC
         self.auth = auth
         self.start_time = None
         self.max_count = max_count
