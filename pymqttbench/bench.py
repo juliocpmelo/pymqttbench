@@ -114,7 +114,7 @@ def show_progress(subs, pubs, pub_count, force=False):
 
     curr_time = datetime.datetime.utcnow()
     if (curr_time - last_time).total_seconds() >= 1 or force:
-        #system("clear")
+        system("clear")
         last_time = curr_time
         print('------------------------')
         print('Connected - subs {} / {} '.format(connected_sub_count.value, subs))
